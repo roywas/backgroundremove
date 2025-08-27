@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quitar fondo de envases – Demo 100% cliente (U²-Net ONNX)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Evita que el canvas se vea borroso en pantallas HiDPI */
+    canvas { image-rendering: crisp-edges; }
+  </style>
+  <!-- ONNX Runtime Web (WASM/WebGL). -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-800">
+  <header class="border-b bg-white">
+    <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+      <h1 class="text-xl md:text-2xl font-semibold">Quitar fondo de envases <span class="text-slate-400">(demo 100% cliente)</span></h1>
+      <div class="text-xs text-slate-500">Modelo: <code>u2netp.onnx</code> · EP: WebGL/WASM</div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6 grid md:grid-cols-3 gap-6">
+    <!-- Panel izquierdo: controles -->
+    <section class="md:col-span-1 space-y-4">
+      <div class="bg-white rounded-2xl shadow p-4 space-y-3">
+        <h2 class="font-medium">1) Cargar imagen o cámara</h2>
+        <input id="fileInput" type="file" accept="image/*" class="w-full text-sm" />
+        <div class="flex items-center gap-2">
+          <button id="startCam" class="px-3 py-2 rounded-xl bg-slate-900 text-white text-sm">Iniciar cámara</button>
+          <button id="snap" class="px-3 py-2 rounded-xl bg-slate-100 text-sm" disabled>Capturar</button>
+          <button id="stopCam" class="px-3 py-2 rounded-xl bg-slate-100 text-sm" disabled>Detener</button>
+        </div>
+        <video id="video" playsinline class="w-full rounded-xl bg-black/5 hidden"></video>
+      </div>
+
+      <div class="bg-white rounded-2xl shadow p-4 space-y-3">
+        <h2 class="font-medium">2) Ajustes de recorte</h2>
+        <label class="flex items-center justify-between text-sm">Umbral
+          <input id="thresh" type="range" min="0" max="100" value="70" class="w-40" />
+        </label>
+        <label class="flex items-center justify-between text-sm">Borde suave (px)
+          <input id="feather" type="range" min="0" max="20" value="6" class="w-40" />
+        </label>
+        <div class="flex items-center gap-2 text-sm">
+          <label class="inline-flex items-center gap-2">
+            <input id="bgTransparent" type="radio" name="bg" value="transparent" checked>
+            <span>Fondo transparente (PNG)</span>
+          </label>
+        </div>
+        <div class="flex items-center gap-2 text-sm">
+          <label class="inline-flex items-center gap-2">
+            <input id="bgWhite" type="radio" name="bg" value="white">
+            <span>Fondo blanco (JPG)</span>
+          </label>
+        </div>
+        <button id="removeBtn" class="w-full px-3 py-2 rounded-xl bg-emerald-600 text-white">Quitar fondo</button>
+      </div>
+
+      <div class="bg-white rounded-2xl shadow p-4 space-y-3">
+        <h2 class="font-medium">3) Exportar</h2>
+        <div class="text-xs text-slate-500">Formato depende del fondo elegido.</div>
+        <button id="downloadBtn" class="w-full px-3 py-2 rounded-xl bg-slate-900 text-white" disabled>Descargar resultado</button>
+      </div>
+
+      <div class="bg-white rounded-2xl shadow p-4 text-xs text-slate-500 leading-relaxed">
+        <p><strong>Consejos:</strong> Centra el envase en la foto, evita sombras duras y fondos muy complejos. Para lotes o máxima calidad, podemos integrar WebGPU y modelos más grandes.</p>
+      </div>
+    </section>
+
+    <!-- Panel central: original -->
+    <section class="md:col-span-1">
+      <div class="bg-white rounded-2xl shadow p-4">
+        <h2 class="font-medium mb-3">Imagen original</h2>
+        <canvas id="canvasIn" class="w-full rounded-xl bg-slate-100 aspect-square"></canvas>
+      </div>
+    </section>
+
+    <!-- Panel derecho: resultado -->
+    <section class="md:col-span-1">
+      <div class="bg-white rounded-2xl shadow p-4">
+        <h2 class="font-medium mb-3">Resultado sin fondo</h2>
+        <canvas id="canvasOut" class="w-full rounded-xl bg-white aspect-square"></canvas>
+      </div>
+      <div class="bg-white rounded-2xl shadow p-4 mt-4">
+        <h3 class="font-medium mb-2">Máscara (vista previa)</h3>
+        <canvas id="canvasMask" class="w-full rounded-xl bg-slate-100 aspect-square"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <footer class="max-w-6xl mx-auto px-4 pb-10 text-xs text-slate-400">
+    <p>Esta demo usa <strong>U²-Net (u2netp)</strong> para detección de objeto saliente, ejecutado con <strong>onnxruntime-web</strong> en tu navegador. No se sube nada a servidores.</p>
+  </footer>
+
+  <script>
+    // ------- Config del modelo -------
+    const MODEL_URL = './models/u2netp.onnx'; // Coloca aquí u2netp.onnx (ligero ~4.7MB)
+    let session = null;
+
+    // Preferimos WebGL (más rápido) y caemos a WASM si no está disponible
+    const EP = ['webgl', 'wasm'];
+
+    // ------- Elementos UI -------
+    const fileInput = document.getElementById('fileInput');
+    const startCamBtn = document.getElementById('startCam');
+    const snapBtn = document.getElementById('snap');
+    const stopCamBtn = document.getElementById('stopCam');
+    const video = document.getElementById('video');
+    const threshEl = document.getElementById('thresh');
+    const featherEl = document.getElementById('feather');
+    const bgTransparentEl = document.getElementById('bgTransparent');
+    const bgWhiteEl = document.getElementById('bgWhite');
+    const removeBtn = document.getElementById('removeBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+
+    const canvasIn = document.getElementById('canvasIn');
+    const canvasOut = document.getElementById('canvasOut');
+    const canvasMask = document.getElementById('canvasMask');
+    const ctxIn = canvasIn.getContext('2d');
+    const ctxOut = canvasOut.getContext('2d');
+    const ctxMask = canvasMask.getContext('2d');
+
+    let stream = null;
+    let sourceImage = new Image();
+    let resultMime = 'image/png';
+
+    // Dimensiones de trabajo (cuadrado para UI; se rescalea internamente)
+    const VIEW_SIZE = 640; // lienzos visibles
+    canvasIn.width = canvasIn.height = VIEW_SIZE;
+    canvasOut.width = canvasOut.height = VIEW_SIZE;
+    canvasMask.width = canvasMask.height = VIEW_SIZE;
+
+    // Carga del modelo
+    async function loadModel() {
+      if (session) return session;
+      try {
+        session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: EP });
+        console.log('ONNX model loaded');
+      } catch (e) {
+        console.error('No se pudo cargar el modelo', e);
+        alert('Error cargando el modelo ONNX. Revisa la ruta ./models/u2netp.onnx');
+      }
+      return session;
+    }
+
+    // Utilidades
+    function drawToCanvas(img) {
+      // Ajuste manteniendo proporción dentro del cuadrado VIEW_SIZE
+      const { width: iw, height: ih } = img;
+      const scale = Math.min(VIEW_SIZE / iw, VIEW_SIZE / ih);
+      const w = Math.round(iw * scale);
+      const h = Math.round(ih * scale);
+      const x = Math.floor((VIEW_SIZE - w) / 2);
+      const y = Math.floor((VIEW_SIZE - h) / 2);
+
+      ctxIn.clearRect(0, 0, VIEW_SIZE, VIEW_SIZE);
+      ctxIn.fillStyle = '#f1f5f9';
+      ctxIn.fillRect(0, 0, VIEW_SIZE, VIEW_SIZE);
+      ctxIn.drawImage(img, x, y, w, h);
+
+      // duplica en salida para tener referencia inicial
+      ctxOut.clearRect(0, 0, VIEW_SIZE, VIEW_SIZE);
+      ctxOut.fillStyle = bgWhiteEl.checked ? '#ffffff' : '#00000000';
+      ctxOut.fillRect(0, 0, VIEW_SIZE, VIEW_SIZE);
+      ctxOut.drawImage(img, x, y, w, h);
+    }
+
+    function loadFile(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = reject;
+        img.src = url;
+      });
+    }
+
+    function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+
+    function resizeImageData(srcCtx, srcW, srcH, dstW, dstH) {
+      // Crea un canvas temporal para reescalar imagen/máscara
+      const t = document.createElement('canvas');
+      t.width = dstW; t.height = dstH;
+      const tc = t.getContext('2d');
+      tc.drawImage(srcCtx.canvas, 0, 0, srcW, srcH, 0, 0, dstW, dstH);
+      return tc.getImageData(0, 0, dstW, dstH);
+    }
+
+    function gaussianFeather(maskData, w, h, radius) {
+      if (radius <= 0) return maskData;
+      // Sencillo blur separable (caja repetida) para suavizar bordes
+      const out = new Uint8ClampedArray(maskData.data);
+      const tmp = new Uint8ClampedArray(out);
+      const passes = Math.max(1, Math.min(3, Math.round(radius / 4)));
+      const kerSize = radius * 2 + 1;
+
+      const passBlur = (src, dst) => {
+        // Horizontal
+        for (let y = 0; y < h; y++) {
+          let sum = 0;
+          for (let x = -radius; x <= radius; x++) {
+            const xx = Math.min(w - 1, Math.max(0, x));
+            sum += src[(y * w + xx) * 4];
+          }
+          for (let x = 0; x < w; x++) {
+            const idx = (y * w + x) * 4;
+            dst[idx] = dst[idx+1] = dst[idx+2] = Math.round(sum / kerSize);
+            dst[idx+3] = 255;
+            const xl = Math.max(0, x - radius);
+            const xr = Math.min(w - 1, x + radius);
+            sum += src[(y * w + xr) * 4] - src[(y * w + xl) * 4];
+          }
+        }
+        // Vertical
+        tmp.set(dst);
+        for (let x = 0; x < w; x++) {
+          let sum = 0;
+          for (let y = -radius; y <= radius; y++) {
+            const yy = Math.min(h - 1, Math.max(0, y));
+            sum += tmp[(yy * w + x) * 4];
+          }
+          for (let y = 0; y < h; y++) {
+            const idx = (y * w + x) * 4;
+            dst[idx] = dst[idx+1] = dst[idx+2] = Math.round(sum / kerSize);
+            dst[idx+3] = 255;
+            const yt = Math.max(0, y - radius);
+            const yb = Math.min(h - 1, y + radius);
+            sum += tmp[(yb * w + x) * 4] - tmp[(yt * w + x) * 4];
+          }
+        }
+      };
+
+      for (let i = 0; i < passes; i++) passBlur(maskData.data, out);
+      maskData.data.set(out);
+      return maskData;
+    }
+
+    async function runU2NetOnImage(img) {
+      await loadModel();
+
+      // Preprocesado: redimensionar a 320x320 y normalizar
+      const INPUT_SIZE = 320;
+      const tmp = document.createElement('canvas');
+      tmp.width = INPUT_SIZE; tmp.height = INPUT_SIZE;
+      const tctx = tmp.getContext('2d');
+
+      // Encajar la imagen dentro del cuadrado (letterbox) para no deformar
+      const scale = Math.min(INPUT_SIZE / img.width, INPUT_SIZE / img.height);
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const x = Math.floor((INPUT_SIZE - w) / 2);
+      const y = Math.floor((INPUT_SIZE - h) / 2);
+      tctx.fillStyle = '#000'; // fondo neutro
+      tctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+      tctx.drawImage(img, x, y, w, h);
+
+      const imgData = tctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+
+      // Normalización tipo ImageNet
+      const mean = [0.485, 0.456, 0.406];
+      const std = [0.229, 0.224, 0.225];
+      const input = new Float32Array(1 * 3 * INPUT_SIZE * INPUT_SIZE);
+      for (let i = 0; i < INPUT_SIZE * INPUT_SIZE; i++) {
+        const r = imgData[i * 4] / 255;
+        const g = imgData[i * 4 + 1] / 255;
+        const b = imgData[i * 4 + 2] / 255;
+        // CHW
+        input[i] = (r - mean[0]) / std[0];
+        input[INPUT_SIZE * INPUT_SIZE + i] = (g - mean[1]) / std[1];
+        input[2 * INPUT_SIZE * INPUT_SIZE + i] = (b - mean[2]) / std[2];
+      }
+
+      const tensor = new ort.Tensor('float32', input, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+      const feeds = { [session.inputNames[0]]: tensor };
+      const outputMap = await session.run(feeds);
+      const out = outputMap[session.outputNames[0]]; // [1,1,320,320]
+      const raw = out.data; // Float32Array
+
+      // Convierte a 0..255 con sigmoid y normaliza min-max
+      let min = Infinity, max = -Infinity;
+      const sal = new Float32Array(INPUT_SIZE * INPUT_SIZE);
+      for (let i = 0; i < raw.length; i++) {
+        const v = sigmoid(raw[i]);
+        sal[i] = v;
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+
+      const maskCanvas = document.createElement('canvas');
+      maskCanvas.width = INPUT_SIZE; maskCanvas.height = INPUT_SIZE;
+      const mctx = maskCanvas.getContext('2d');
+      const maskImage = mctx.createImageData(INPUT_SIZE, INPUT_SIZE);
+      for (let i = 0; i < sal.length; i++) {
+        const n = (sal[i] - min) / (max - min + 1e-6); // 0..1
+        const u8 = Math.max(0, Math.min(255, Math.round(n * 255)));
+        maskImage.data[i * 4] = u8;
+        maskImage.data[i * 4 + 1] = u8;
+        maskImage.data[i * 4 + 2] = u8;
+        maskImage.data[i * 4 + 3] = 255;
+      }
+      mctx.putImageData(maskImage, 0, 0);
+
+      return { maskCanvas, letterbox: {x, y, w, h, size: INPUT_SIZE} };
+    }
+
+    function applyMaskToOriginal(img, maskCanvas, letterbox, opts) {
+      const { threshold = 0.7, feather = 6, bg = 'transparent' } = opts;
+      // Preparar lienzos de trabajo al tamaño de visualización, respetando proporción
+      const scale = Math.min(VIEW_SIZE / img.width, VIEW_SIZE / img.height);
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const offX = Math.floor((VIEW_SIZE - w) / 2);
+      const offY = Math.floor((VIEW_SIZE - h) / 2);
+
+      // Dibuja imagen centrada en canvasOut
+      ctxOut.clearRect(0, 0, VIEW_SIZE, VIEW_SIZE);
+      if (bg === 'white') { ctxOut.fillStyle = '#fff'; ctxOut.fillRect(0,0,VIEW_SIZE,VIEW_SIZE); }
+      ctxOut.drawImage(img, offX, offY, w, h);
+
+      // Reconstruir máscara al mismo encuadre (letterbox) y escalar a view
+      const mtemp = document.createElement('canvas');
+      mtemp.width = VIEW_SIZE; mtemp.height = VIEW_SIZE;
+      const mctx = mtemp.getContext('2d');
+      mctx.fillStyle = '#000';
+      mctx.fillRect(0, 0, VIEW_SIZE, VIEW_SIZE);
+
+      // La máscara está en 320x320 con el objeto dentro del letterbox
+      // La llevamos a w x h y la colocamos en (offX, offY)
+      mctx.drawImage(maskCanvas, 0, 0, letterbox.size, letterbox.size, offX, offY, w, h);
+
+      // Umbral + pluma
+      let mdata = mctx.getImageData(0, 0, VIEW_SIZE, VIEW_SIZE);
+      const t = Math.round(threshold * 255);
+      const data = mdata.data;
+      for (let i = 0; i < data.length; i += 4) {
+        const v = data[i];
+        data[i] = data[i+1] = data[i+2] = v >= t ? 255 : 0; // binariza
+        data[i+3] = 255;
+      }
+      mdata = gaussianFeather(mdata, VIEW_SIZE, VIEW_SIZE, feather);
+      mctx.putImageData(mdata, 0, 0);
+
+      // Aplica máscara como alpha al canvasOut
+      const outData = ctxOut.getImageData(0, 0, VIEW_SIZE, VIEW_SIZE);
+      const o = outData.data, md = mctx.getImageData(0, 0, VIEW_SIZE, VIEW_SIZE).data;
+      for (let i = 0; i < o.length; i += 4) {
+        const alpha = md[i]; // 0..255
+        if (bg === 'transparent') {
+          o[i+3] = alpha; // alpha directo
+        } else {
+          // Compositing sobre blanco: alpha mix
+          const a = alpha / 255;
+          o[i]   = Math.round(o[i]   * a + 255 * (1 - a));
+          o[i+1] = Math.round(o[i+1] * a + 255 * (1 - a));
+          o[i+2] = Math.round(o[i+2] * a + 255 * (1 - a));
+          o[i+3] = 255;
+        }
+      }
+      ctxOut.putImageData(outData, 0, 0);
+
+      // Vista de la máscara para depuración
+      ctxMask.clearRect(0, 0, VIEW_SIZE, VIEW_SIZE);
+      ctxMask.drawImage(mtemp, 0, 0);
+
+      // Define el tipo de exportación
+      resultMime = (bg === 'transparent') ? 'image/png' : 'image/jpeg';
+      downloadBtn.disabled = false;
+    }
+
+    // ------- Eventos -------
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      sourceImage = await loadFile(file);
+      drawToCanvas(sourceImage);
+    });
+
+    startCamBtn.addEventListener('click', async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+        video.srcObject = stream;
+        await video.play();
+        video.classList.remove('hidden');
+        snapBtn.disabled = false; stopCamBtn.disabled = false; startCamBtn.disabled = true;
+      } catch (err) {
+        alert('No se pudo acceder a la cámara');
+        console.error(err);
+      }
+    });
+
+    snapBtn.addEventListener('click', () => {
+      if (!video.srcObject) return;
+      // Dibuja frame actual del vídeo en canvasIn y crea una Image para mantener coherencia
+      ctxIn.drawImage(video, 0, 0, VIEW_SIZE, VIEW_SIZE);
+      const dataUrl = canvasIn.toDataURL();
+      const img = new Image();
+      img.onload = () => { sourceImage = img; drawToCanvas(img); };
+      img.src = dataUrl;
+    });
+
+    stopCamBtn.addEventListener('click', () => {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.classList.add('hidden');
+      snapBtn.disabled = true; stopCamBtn.disabled = true; startCamBtn.disabled = false;
+    });
+
+    removeBtn.addEventListener('click', async () => {
+      if (!sourceImage || !sourceImage.width) { alert('Primero carga una imagen o captura desde la cámara.'); return; }
+      removeBtn.disabled = true; removeBtn.textContent = 'Procesando...';
+      try {
+        const { maskCanvas, letterbox } = await runU2NetOnImage(sourceImage);
+        const threshold = Number(threshEl.value) / 100;
+        const feather = Number(featherEl.value);
+        const bg = bgWhiteEl.checked ? 'white' : 'transparent';
+        applyMaskToOriginal(sourceImage, maskCanvas, letterbox, { threshold, feather, bg });
+      } catch (e) {
+        console.error(e);
+        alert('Hubo un problema al procesar la imagen. Revisa la consola.');
+      } finally {
+        removeBtn.disabled = false; removeBtn.textContent = 'Quitar fondo';
+      }
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      const link = document.createElement('a');
+      link.download = bgWhiteEl.checked ? 'envase_fondo_blanco.jpg' : 'envase_sin_fondo.png';
+      link.href = canvasOut.toDataURL(resultMime, 0.95);
+      link.click();
+    });
+
+    // Carga perezosa del modelo al interactuar
+    window.addEventListener('mousemove', loadModel, { once: true });
+    window.addEventListener('touchstart', loadModel, { once: true });
+  </script>
+</body>
+</html>
